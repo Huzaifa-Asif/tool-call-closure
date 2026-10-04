@@ -5,6 +5,9 @@ const DEFAULTS = Object.freeze({
   maxDiagnostics: 100,
   maxResultBytes: 1_048_576,
   maxMessageBytes: 4_096,
+  maxIdBytes: 512,
+  maxNameBytes: 512,
+  maxCodeBytes: 128,
 });
 
 const VALID_STATUSES = new Set(['success', 'error', 'cancelled']);
@@ -24,12 +27,20 @@ function nonEmptyString(value, name) {
   return value;
 }
 
+function boundedString(value, name, maxBytes) {
+  const text = nonEmptyString(value, name);
+  if (Buffer.byteLength(text) > maxBytes) throw new RangeError(`${name} exceeds its byte limit (${maxBytes})`);
+  return text;
+}
+
 function truncateUtf8(value, maxBytes) {
   const text = String(value);
-  if (Buffer.byteLength(text) <= maxBytes) return text;
-  let end = Math.min(text.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(text.slice(0, end)) > maxBytes - 3) end -= 1;
-  return `${text.slice(0, end)}...`;
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  const suffix = maxBytes >= 3 ? '...' : '';
+  let end = maxBytes - Buffer.byteLength(suffix);
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return `${bytes.subarray(0, end).toString('utf8')}${suffix}`;
 }
 
 function serializeContent(value, maxBytes) {
@@ -56,6 +67,7 @@ class ToolCallClosure {
   #generation = 0;
   #run = null;
   #diagnostics = [];
+  #snapshots = new WeakSet();
 
   constructor(options = {}) {
     if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -66,6 +78,9 @@ class ToolCallClosure {
       maxDiagnostics: positiveInteger(options.maxDiagnostics ?? DEFAULTS.maxDiagnostics, 'maxDiagnostics'),
       maxResultBytes: positiveInteger(options.maxResultBytes ?? DEFAULTS.maxResultBytes, 'maxResultBytes'),
       maxMessageBytes: positiveInteger(options.maxMessageBytes ?? DEFAULTS.maxMessageBytes, 'maxMessageBytes'),
+      maxIdBytes: positiveInteger(options.maxIdBytes ?? DEFAULTS.maxIdBytes, 'maxIdBytes'),
+      maxNameBytes: positiveInteger(options.maxNameBytes ?? DEFAULTS.maxNameBytes, 'maxNameBytes'),
+      maxCodeBytes: positiveInteger(options.maxCodeBytes ?? DEFAULTS.maxCodeBytes, 'maxCodeBytes'),
     });
   }
 
@@ -84,12 +99,12 @@ class ToolCallClosure {
       if (!call || typeof call !== 'object' || Array.isArray(call)) {
         throw new TypeError(`calls[${index}] must be an object`);
       }
-      const id = nonEmptyString(call.id, `calls[${index}].id`);
+      const id = boundedString(call.id, `calls[${index}].id`, this.#options.maxIdBytes);
       if (seen.has(id)) throw new TypeError(`duplicate tool call id: ${id}`);
       seen.add(id);
       return {
         id,
-        name: nonEmptyString(call.name, `calls[${index}].name`),
+        name: boundedString(call.name, `calls[${index}].name`, this.#options.maxNameBytes),
         state: 'pending',
         settlement: null,
       };
@@ -120,9 +135,10 @@ class ToolCallClosure {
   }
 
   settle(handle, callId, outcome) {
-    nonEmptyString(callId, 'callId');
-    const generation = handle?.generation ?? null;
-    const observedStatus = outcome?.status ?? null;
+    boundedString(callId, 'callId', this.#options.maxIdBytes);
+    const candidateGeneration = handle?.generation;
+    const generation = Number.isSafeInteger(candidateGeneration) && candidateGeneration > 0 ? candidateGeneration : null;
+    const observedStatus = VALID_STATUSES.has(outcome?.status) ? outcome.status : (outcome?.status == null ? null : 'invalid');
 
     if (!this.#run || handle !== this.#run.handle) {
       return this.#reject('stale_generation', callId, generation, observedStatus);
@@ -153,7 +169,8 @@ class ToolCallClosure {
   }
 
   close(handle, reason = {}) {
-    const generation = handle?.generation ?? null;
+    const candidateGeneration = handle?.generation;
+    const generation = Number.isSafeInteger(candidateGeneration) && candidateGeneration > 0 ? candidateGeneration : null;
     if (!this.#run || handle !== this.#run.handle) {
       return this.#reject('stale_generation', null, generation, null);
     }
@@ -163,7 +180,7 @@ class ToolCallClosure {
     if (!CLOSE_STATUSES.has(status)) {
       throw new TypeError('close status must be error or cancelled');
     }
-    const code = nonEmptyString(reason.code ?? status, 'reason.code');
+    const code = boundedString(reason.code ?? status, 'reason.code', this.#options.maxCodeBytes);
     const sideEffectState = reason.sideEffectState ?? 'unknown';
     if (sideEffectState !== 'unknown' && sideEffectState !== 'not_started') {
       throw new TypeError('reason.sideEffectState must be unknown or not_started');
@@ -184,7 +201,8 @@ class ToolCallClosure {
   }
 
   seal(handle) {
-    const generation = handle?.generation ?? null;
+    const candidateGeneration = handle?.generation;
+    const generation = Number.isSafeInteger(candidateGeneration) && candidateGeneration > 0 ? candidateGeneration : null;
     if (!this.#run || handle !== this.#run.handle) {
       return this.#reject('stale_generation', null, generation, null);
     }
@@ -199,13 +217,15 @@ class ToolCallClosure {
 
   snapshot() {
     if (!this.#run) return null;
-    return freezeCopy({
+    const snapshot = freezeCopy({
       generation: this.#run.generation,
       closed: this.#run.closed,
       closeReason: this.#run.closeReason,
       calls: this.#run.calls.map(({ id, name, state, settlement }) => ({ id, name, state, settlement })),
       diagnostics: this.#diagnostics,
     });
+    this.#snapshots.add(snapshot);
+    return snapshot;
   }
 
   toOpenAIChatCompletions(snapshot = this.snapshot()) {
@@ -249,7 +269,7 @@ class ToolCallClosure {
     }
     return Object.freeze({
       status,
-      code: nonEmptyString(outcome.code ?? status, 'outcome.code'),
+      code: boundedString(outcome.code ?? status, 'outcome.code', this.#options.maxCodeBytes),
       message: truncateUtf8(outcome.message ?? (status === 'error' ? 'Tool call failed.' : 'Tool call was cancelled.'), this.#options.maxMessageBytes),
       provenance: 'reported',
     });
@@ -265,7 +285,7 @@ class ToolCallClosure {
   }
 
   #assertSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.calls)) {
+    if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.calls) || !this.#snapshots.has(snapshot)) {
       throw new TypeError('snapshot must be a ToolCallClosure snapshot');
     }
     if (!snapshot.closed) throw new TypeError('snapshot must be sealed before provider export');

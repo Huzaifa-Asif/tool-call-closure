@@ -67,6 +67,9 @@ Returns a `ToolCallClosure`. The class constructor accepts the same options.
 | `maxDiagnostics` | `100` | Maximum rejected-operation diagnostics retained |
 | `maxResultBytes` | `1048576` | Maximum UTF-8 bytes in a reported success result |
 | `maxMessageBytes` | `4096` | Maximum UTF-8 bytes in error/cancellation messages |
+| `maxIdBytes` | `512` | Maximum UTF-8 bytes in a tool-call ID |
+| `maxNameBytes` | `512` | Maximum UTF-8 bytes in a tool name |
+| `maxCodeBytes` | `128` | Maximum UTF-8 bytes in an error/cancellation code |
 
 All limits must be positive safe integers.
 
@@ -144,7 +147,7 @@ For OpenAI, choose the adapter matching the API you call; Chat Completions and R
 ```js
 const timer = setTimeout(() => {
   controller.abort();
-  closure.close(generation, {
+  closure.close(handle, {
     status: 'cancelled', code: 'timeout', message: 'Tool deadline elapsed.',
   });
 }, 10_000);

@@ -171,3 +171,45 @@ test('rejects incomplete streaming fragments as registrations', () => {
   assert.throws(() => closure.begin([{ id: 'partial_id_only' }]), /name/);
   assert.equal(closure.snapshot(), null);
 });
+
+test('rejects forged closed snapshots and snapshots from another closure', () => {
+  const closure = new ToolCallClosure();
+  const forged = Object.freeze({
+    generation: 1,
+    closed: true,
+    closeReason: { status: 'complete' },
+    calls: [{ id: 'done', name: 'x', state: 'success', settlement: { status: 'success', content: 'ok' } },
+      { id: 'pending', name: 'y', state: 'pending', settlement: null }],
+    diagnostics: [],
+  });
+  assert.throws(() => closure.toOpenAIResponses(forged), /ToolCallClosure snapshot/);
+
+  const other = new ToolCallClosure();
+  const { handle } = other.begin([]);
+  assert.throws(() => closure.toOpenAIResponses(other.seal(handle)), /ToolCallClosure snapshot/);
+});
+
+test('bounds ids, names, codes, tiny messages, and invalid late statuses', () => {
+  const closure = new ToolCallClosure({ maxIdBytes: 2, maxNameBytes: 2, maxCodeBytes: 2, maxMessageBytes: 1 });
+  assert.throws(() => closure.begin([{ id: '123', name: 'x' }]), /byte limit/);
+  assert.throws(() => closure.begin([{ id: 'x', name: '123' }]), /byte limit/);
+  const { handle } = closure.begin([{ id: 'x', name: 'y' }]);
+  assert.throws(() => closure.fail(handle, 'x', 'bad', '123'), /byte limit/);
+  const closed = closure.close(handle, { code: 'zz', message: 'éé', sideEffectState: 'unknown' });
+  assert.ok(Buffer.byteLength(closed.calls[0].settlement.message) <= 1);
+  const invalid = closure.settle(handle, 'x', { status: 'arbitrarily-long-untrusted-status' });
+  assert.equal(invalid.observedStatus, 'invalid');
+});
+
+test('does not retain oversized diagnostic ids or malformed forged generations', () => {
+  const closure = new ToolCallClosure({ maxIdBytes: 2 });
+  const { handle } = closure.begin([]);
+  assert.throws(() => closure.succeed(handle, 'oversized', 'x'), /byte limit/);
+  assert.equal(closure.snapshot().diagnostics.length, 0);
+
+  const malformed = Object.freeze({ generation: { self: null } });
+  malformed.generation.self = malformed.generation;
+  const rejected = closure.close(malformed);
+  assert.equal(rejected.reason, 'stale_generation');
+  assert.equal(rejected.generation, null);
+});

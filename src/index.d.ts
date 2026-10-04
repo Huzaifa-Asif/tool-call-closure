@@ -26,6 +26,9 @@ export interface ToolCallClosureOptions {
   maxDiagnostics?: number;
   maxResultBytes?: number;
   maxMessageBytes?: number;
+  maxIdBytes?: number;
+  maxNameBytes?: number;
+  maxCodeBytes?: number;
 }
 export interface Outcome {
   status: 'success' | 'error' | 'cancelled';
@@ -44,9 +47,9 @@ export declare class ToolCallClosure {
   close(handle: BatchHandle, reason?: { status?: 'error' | 'cancelled'; code?: string; message?: string; sideEffectState?: 'unknown' | 'not_started' }): Snapshot | SettlementResult;
   seal(handle: BatchHandle): Snapshot | SettlementResult;
   snapshot(): Snapshot | null;
-  toOpenAIChatCompletions(snapshot?: Snapshot | null): readonly Readonly<{ role: 'tool'; tool_call_id: string; content: string }>[];
-  toOpenAIResponses(snapshot?: Snapshot | null): readonly Readonly<{ type: 'function_call_output'; call_id: string; output: string }>[];
-  toAnthropicToolResults(snapshot?: Snapshot | null): readonly Readonly<{ type: 'tool_result'; tool_use_id: string; content: string; is_error?: true }>[];
+  toOpenAIChatCompletions(snapshot?: Snapshot): readonly Readonly<{ role: 'tool'; tool_call_id: string; content: string }>[];
+  toOpenAIResponses(snapshot?: Snapshot): readonly Readonly<{ type: 'function_call_output'; call_id: string; output: string }>[];
+  toAnthropicToolResults(snapshot?: Snapshot): readonly Readonly<{ type: 'tool_result'; tool_use_id: string; content: string; is_error?: true }>[];
 }
 export declare function createToolCallClosure(options?: ToolCallClosureOptions): ToolCallClosure;
 declare const api: Readonly<{ ToolCallClosure: typeof ToolCallClosure; createToolCallClosure: typeof createToolCallClosure }>;
