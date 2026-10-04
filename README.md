@@ -4,8 +4,6 @@
 
 It records calls in source order, accepts each real result once, creates explicit **error/cancelled** outcomes for calls still pending at closure, and rejects late results from old generations. It can format a completed batch for OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages.
 
-> Development status: locally prepared and unpublished. The API may change before `1.0.0`.
-
 ## Why this exists
 
 Provider protocols associate each tool result with a prior tool call. Incomplete lifecycles can make a later request invalid. This is especially easy to get wrong when an `AbortSignal`, deadline, concurrency race, or request replacement intersects a batch of tools.
