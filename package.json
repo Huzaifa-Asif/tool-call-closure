@@ -1,0 +1,26 @@
+{
+  "name": "tool-call-closure",
+  "version": "0.0.0-development",
+  "description": "Close pending AI tool calls deterministically and fence stale results after aborts, timeouts, limits, or supersession.",
+  "keywords": ["ai", "agents", "tool-calling", "openai", "anthropic", "cancellation", "llm"],
+  "license": "MIT",
+  "author": "Huzaifa Asif",
+  "repository": { "type": "git", "url": "git+https://github.com/Huzaifa-Asif/tool-call-closure.git" },
+  "bugs": { "url": "https://github.com/Huzaifa-Asif/tool-call-closure/issues" },
+  "homepage": "https://github.com/Huzaifa-Asif/tool-call-closure#readme",
+  "type": "module",
+  "main": "./src/index.cjs",
+  "module": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": { ".": { "types": "./src/index.d.ts", "import": "./src/index.js", "require": "./src/index.cjs" } },
+  "files": ["src", "README.md", "LICENSE", "NOTICE.md", "CHANGELOG.md"],
+  "engines": { "node": ">=18" },
+  "sideEffects": false,
+  "scripts": {
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test",
+    "test:coverage": "node --experimental-test-coverage --test",
+    "check": "npm run lint && npm run test:coverage && npm pack --dry-run"
+  },
+  "publishConfig": { "access": "public" }
+}

@@ -1,0 +1,15 @@
+name: Feature request
+description: Propose a focused improvement
+title: "[Feature]: "
+body:
+  - type: textarea
+    attributes:
+      label: Problem
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed scope
+      description: Explain why this belongs in a small lifecycle primitive rather than an agent runtime.
+    validations:
+      required: true
