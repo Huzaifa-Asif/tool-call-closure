@@ -67,9 +67,11 @@ Returns a `ToolCallClosure`. The class constructor accepts the same options.
 | `maxMessageBytes` | `4096` | Maximum UTF-8 bytes in error/cancellation messages |
 | `maxIdBytes` | `512` | Maximum UTF-8 bytes in a tool-call ID |
 | `maxNameBytes` | `512` | Maximum UTF-8 bytes in a tool name |
-| `maxCodeBytes` | `128` | Maximum UTF-8 bytes in an error/cancellation code |
+| `maxCodeBytes` | `128` | Maximum UTF-8 bytes in a caller-supplied error/cancellation code |
 
 All limits must be positive safe integers.
+
+Built-in default codes (`error`, `cancelled`, `tool_error`, and `superseded`) stay intact even when `maxCodeBytes` is smaller; they are fixed strings of at most 10 bytes. Explicitly supplied codes, including these same strings, must fit the configured limit.
 
 ### `begin(calls)`
 
@@ -80,6 +82,7 @@ const { generation, handle, superseded } = closure.begin(calls);
 ```
 
 Invalid new input is validated before the current generation is superseded.
+Sparse call arrays are invalid. If a call getter starts a newer generation during validation, the outer `begin` throws without replacing that newer generation.
 
 `handle` is an immutable, identity-checked batch handle. Keep it with the promises launched for that batch. A copied `{ generation }` object is not accepted.
 
@@ -98,6 +101,8 @@ closure.settle(handle, 'call_3', { status: 'cancelled', code: 'abort', message: 
 `succeed`, `fail`, and `cancel` are convenience methods. Results return `{ accepted: true, ... }` or `{ accepted: false, reason, ... }`; expected races do not throw. Rejection reasons are `stale_generation`, `run_closed`, `unknown_call`, and `duplicate_settlement`.
 
 Success objects are JSON-stringified at settlement. Circular, undefined, or oversized values throw without changing call state. `fail(Error)` retains the message only, never the stack.
+
+Getters, `toJSON`, and string conversion can execute caller code. State is rechecked after normalization: a nested settlement or closure wins, and a result for a superseded generation is rejected. If caller code itself changes state and then throws, that nested change is preserved. Closed snapshots remain detached and unchanged.
 
 ### `close(handle, reason?)`
 

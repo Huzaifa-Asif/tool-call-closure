@@ -89,33 +89,41 @@ class ToolCallClosure {
   }
 
   begin(calls) {
+    const startingGeneration = this.#generation;
     if (!Array.isArray(calls)) throw new TypeError('calls must be an array');
-    if (calls.length > this.#options.maxCalls) {
+    const count = calls.length;
+    if (!Number.isSafeInteger(count) || count < 0) throw new TypeError('calls.length must be a non-negative safe integer');
+    if (count > this.#options.maxCalls) {
       throw new RangeError(`calls exceed maxCalls (${this.#options.maxCalls})`);
     }
 
     const seen = new Set();
-    const normalized = calls.map((call, index) => {
+    const normalized = [];
+    for (let index = 0; index < count; index += 1) {
+      const call = calls[index];
       if (!call || typeof call !== 'object' || Array.isArray(call)) {
         throw new TypeError(`calls[${index}] must be an object`);
       }
       const id = boundedString(call.id, `calls[${index}].id`, this.#options.maxIdBytes);
       if (seen.has(id)) throw new TypeError(`duplicate tool call id: ${id}`);
       seen.add(id);
-      return {
+      normalized.push({
         id,
         name: boundedString(call.name, `calls[${index}].name`, this.#options.maxNameBytes),
         state: 'pending',
         settlement: null,
-      };
-    });
+      });
+    }
+    if (this.#generation !== startingGeneration) {
+      throw new TypeError('active generation changed while validating calls');
+    }
 
     let superseded = null;
     if (this.#run && !this.#run.closed) {
-      superseded = this.close(this.#run.handle, {
+      superseded = this.#commitClose(this.#run, {
         status: 'cancelled',
         code: 'superseded',
-        message: 'Tool call was superseded by a newer generation.',
+        message: truncateUtf8('Tool call was superseded by a newer generation.', this.#options.maxMessageBytes),
         sideEffectState: 'unknown',
       });
     }
@@ -135,10 +143,15 @@ class ToolCallClosure {
   }
 
   settle(handle, callId, outcome) {
+    return this.#settle(handle, callId, outcome);
+  }
+
+  #settle(handle, callId, outcome, defaultCode) {
     boundedString(callId, 'callId', this.#options.maxIdBytes);
     const candidateGeneration = handle?.generation;
     const generation = Number.isSafeInteger(candidateGeneration) && candidateGeneration > 0 ? candidateGeneration : null;
-    const observedStatus = VALID_STATUSES.has(outcome?.status) ? outcome.status : (outcome?.status == null ? null : 'invalid');
+    const candidateStatus = outcome?.status;
+    const observedStatus = VALID_STATUSES.has(candidateStatus) ? candidateStatus : (candidateStatus == null ? null : 'invalid');
 
     if (!this.#run || handle !== this.#run.handle) {
       return this.#reject('stale_generation', callId, generation, observedStatus);
@@ -149,7 +162,12 @@ class ToolCallClosure {
     if (!call) return this.#reject('unknown_call', callId, generation);
     if (call.state !== 'pending') return this.#reject('duplicate_settlement', callId, generation);
 
-    const settlement = this.#normalizeOutcome(outcome);
+    const settlement = this.#normalizeOutcome(outcome, defaultCode);
+    // JSON serialization, getters, and string conversion can run caller code.
+    // A nested terminal write or newer generation wins over this operation.
+    if (handle !== this.#run.handle) return this.#reject('stale_generation', callId, generation, settlement.status);
+    if (this.#run.closed) return this.#reject('run_closed', callId, generation, settlement.status);
+    if (call.state !== 'pending') return this.#reject('duplicate_settlement', callId, generation, settlement.status);
     call.state = settlement.status;
     call.settlement = settlement;
     return freezeCopy({ accepted: true, generation, callId, settlement });
@@ -159,13 +177,13 @@ class ToolCallClosure {
     return this.settle(handle, callId, { status: 'success', content });
   }
 
-  fail(handle, callId, error, code = 'tool_error') {
+  fail(handle, callId, error, code) {
     const message = error instanceof Error ? error.message : String(error);
-    return this.settle(handle, callId, { status: 'error', code, message });
+    return this.#settle(handle, callId, { status: 'error', code, message }, 'tool_error');
   }
 
-  cancel(handle, callId, message = 'Tool call was cancelled.', code = 'cancelled') {
-    return this.settle(handle, callId, { status: 'cancelled', code, message });
+  cancel(handle, callId, message = 'Tool call was cancelled.', code) {
+    return this.#settle(handle, callId, { status: 'cancelled', code, message }, 'cancelled');
   }
 
   close(handle, reason = {}) {
@@ -175,12 +193,14 @@ class ToolCallClosure {
       return this.#reject('stale_generation', null, generation, null);
     }
     if (this.#run.closed) return this.snapshot();
+    const run = this.#run;
 
     const status = reason.status ?? 'cancelled';
     if (!CLOSE_STATUSES.has(status)) {
       throw new TypeError('close status must be error or cancelled');
     }
-    const code = boundedString(reason.code ?? status, 'reason.code', this.#options.maxCodeBytes);
+    const suppliedCode = reason.code;
+    const code = suppliedCode == null ? status : boundedString(suppliedCode, 'reason.code', this.#options.maxCodeBytes);
     const sideEffectState = reason.sideEffectState ?? 'unknown';
     if (sideEffectState !== 'unknown' && sideEffectState !== 'not_started') {
       throw new TypeError('reason.sideEffectState must be unknown or not_started');
@@ -189,14 +209,20 @@ class ToolCallClosure {
       reason.message ?? (status === 'error' ? 'Tool call did not complete.' : 'Tool call was cancelled.'),
       this.#options.maxMessageBytes,
     );
-    for (const call of this.#run.calls) {
+    if (this.#run !== run) return this.#reject('stale_generation', null, generation, null);
+    if (run.closed) return this.snapshot();
+    return this.#commitClose(run, { status, code, message, sideEffectState });
+  }
+
+  #commitClose(run, { status, code, message, sideEffectState }) {
+    for (const call of run.calls) {
       if (call.state === 'pending') {
         call.state = status;
         call.settlement = Object.freeze({ status, code, message, provenance: 'synthetic', sideEffectState });
       }
     }
-    this.#run.closed = true;
-    this.#run.closeReason = { status, code, message, sideEffectState };
+    run.closed = true;
+    run.closeReason = { status, code, message, sideEffectState };
     return this.snapshot();
   }
 
@@ -256,7 +282,7 @@ class ToolCallClosure {
     }));
   }
 
-  #normalizeOutcome(outcome) {
+  #normalizeOutcome(outcome, defaultCode) {
     if (!outcome || typeof outcome !== 'object' || Array.isArray(outcome)) {
       throw new TypeError('outcome must be an object');
     }
@@ -267,9 +293,10 @@ class ToolCallClosure {
     if (status === 'success') {
       return Object.freeze({ status, content: serializeContent(outcome.content, this.#options.maxResultBytes), provenance: 'reported' });
     }
+    const suppliedCode = outcome.code;
     return Object.freeze({
       status,
-      code: boundedString(outcome.code ?? status, 'outcome.code', this.#options.maxCodeBytes),
+      code: suppliedCode == null ? (defaultCode ?? status) : boundedString(suppliedCode, 'outcome.code', this.#options.maxCodeBytes),
       message: truncateUtf8(outcome.message ?? (status === 'error' ? 'Tool call failed.' : 'Tool call was cancelled.'), this.#options.maxMessageBytes),
       provenance: 'reported',
     });
@@ -285,7 +312,7 @@ class ToolCallClosure {
   }
 
   #assertSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'object' || !Array.isArray(snapshot.calls) || !this.#snapshots.has(snapshot)) {
+    if (!snapshot || typeof snapshot !== 'object' || !this.#snapshots.has(snapshot) || !Array.isArray(snapshot.calls)) {
       throw new TypeError('snapshot must be a ToolCallClosure snapshot');
     }
     if (!snapshot.closed) throw new TypeError('snapshot must be sealed before provider export');

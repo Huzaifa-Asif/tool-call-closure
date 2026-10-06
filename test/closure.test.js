@@ -213,3 +213,202 @@ test('does not retain oversized diagnostic ids or malformed forged generations',
   assert.equal(rejected.reason, 'stale_generation');
   assert.equal(rejected.generation, null);
 });
+
+test('preserves closure when success serialization closes the batch reentrantly', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  let first;
+  const result = closure.succeed(handle, 'a', { toJSON() {
+    first = closure.close(handle, { code: 'timeout' });
+    return 'late';
+  } });
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'run_closed');
+  assert.deepEqual(closure.snapshot().calls, first.calls);
+  assert.deepEqual(closure.toOpenAIResponses(), closure.toOpenAIResponses(first));
+});
+
+test('preserves the first settlement when a toJSON callback settles the same call', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  const result = closure.succeed(handle, 'a', { toJSON() {
+    assert.equal(closure.succeed(handle, 'a', 'first').accepted, true);
+    return 'second';
+  } });
+  assert.equal(result.reason, 'duplicate_settlement');
+  assert.equal(closure.snapshot().calls[0].settlement.content, 'first');
+});
+
+test('rejects a success serialized after its generation is superseded', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'old' }]);
+  let next;
+  const result = closure.succeed(handle, 'a', { toJSON() {
+    next = closure.begin([{ id: 'a', name: 'new' }]);
+    return 'old';
+  } });
+  assert.equal(result.reason, 'stale_generation');
+  assert.equal(next.superseded.calls[0].state, 'cancelled');
+  assert.equal(closure.snapshot().calls[0].state, 'pending');
+});
+
+test('outcome getters and message conversion cannot overwrite a terminal write', () => {
+  for (const field of ['status', 'content', 'code', 'message']) {
+    const closure = new ToolCallClosure();
+    const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+    const outcome = field === 'content' ? { status: 'success' } : { status: 'error', code: 'outer', message: 'outer' };
+    const value = field === 'status' ? 'error' : field === 'content' ? 'outer' : 'outer';
+    Object.defineProperty(outcome, field, { get() {
+      closure.succeed(handle, 'a', 'first');
+      return value;
+    } });
+    const result = closure.settle(handle, 'a', outcome);
+    assert.equal(result.reason, 'duplicate_settlement', field);
+    assert.equal(closure.snapshot().calls[0].settlement.content, 'first', field);
+  }
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  const result = closure.cancel(handle, 'a', { toString() {
+    closure.close(handle);
+    return 'outer';
+  } });
+  assert.equal(result.reason, 'run_closed');
+  assert.equal(closure.snapshot().calls[0].settlement.provenance, 'synthetic');
+});
+
+test('failure message getters and conversion preserve nested closure', () => {
+  for (const useError of [false, true]) {
+    const closure = new ToolCallClosure();
+    const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+    const close = () => { closure.close(handle); return 'outer'; };
+    const error = useError ? Object.defineProperty(new Error(), 'message', { get: close }) : { toString: close };
+    assert.equal(closure.fail(handle, 'a', error).reason, 'run_closed');
+    assert.equal(closure.snapshot().calls[0].settlement.provenance, 'synthetic');
+  }
+});
+
+test('nested closure wins over every getter in an outer close reason', () => {
+  for (const field of ['status', 'code', 'sideEffectState', 'message']) {
+    const closure = new ToolCallClosure();
+    const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+    let first;
+    const reason = { status: 'error', code: 'outer', sideEffectState: 'not_started', message: 'outer' };
+    const value = reason[field];
+    Object.defineProperty(reason, field, { get() {
+      first = closure.close(handle, { code: 'first' });
+      return value;
+    } });
+    const result = closure.close(handle, reason);
+    assert.deepEqual(result.calls, first.calls, field);
+    assert.equal(result.closeReason.code, 'first', field);
+  }
+});
+
+test('close message conversion cannot close a newer generation', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'old' }]);
+  const result = closure.close(handle, { message: { toString() {
+    closure.begin([{ id: 'b', name: 'new' }]);
+    return 'old';
+  } } });
+  assert.equal(result.reason, 'stale_generation');
+  assert.equal(closure.snapshot().closed, false);
+  assert.equal(closure.snapshot().calls[0].state, 'pending');
+});
+
+test('nested settlement and seal survive outer close normalization', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  const result = closure.close(handle, { get message() {
+    closure.succeed(handle, 'a', 'first');
+    closure.seal(handle);
+    return 'outer';
+  } });
+  assert.equal(result.closeReason.status, 'complete');
+  assert.equal(result.calls[0].settlement.content, 'first');
+});
+
+test('reentrant begin preserves the newer generation created by an input getter', () => {
+  for (const field of ['id', 'name']) {
+    const closure = new ToolCallClosure();
+    closure.begin([{ id: 'old', name: 'old' }]);
+    const call = { id: 'outer', name: 'outer' };
+    Object.defineProperty(call, field, { get() {
+      closure.begin([{ id: 'new', name: 'new' }]);
+      return 'outer';
+    } });
+    assert.throws(() => closure.begin([call]), /generation changed/);
+    assert.equal(closure.snapshot().calls[0].id, 'new');
+    assert.equal(closure.snapshot().calls[0].state, 'pending');
+  }
+});
+
+test('validates sparse arrays before superseding the active generation', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  assert.throws(() => closure.begin(new Array(1)), /must be an object/);
+  assert.equal(closure.activeGeneration, handle.generation);
+  assert.equal(closure.snapshot().closed, false);
+  assert.equal(closure.succeed(handle, 'a', 'still active').accepted, true);
+});
+
+test('fixed default codes remain usable below maxCodeBytes', () => {
+  const closure = new ToolCallClosure({ maxCodeBytes: 1 });
+  const first = closure.begin([{ id: 'a', name: 'x' }]);
+  const next = closure.begin([{ id: 'b', name: 'x' }, { id: 'c', name: 'x' }, { id: 'd', name: 'x' }, { id: 'e', name: 'x' }]);
+  assert.equal(next.superseded.calls[0].settlement.code, 'superseded');
+  assert.equal(closure.succeed(first.handle, 'a', 'old').reason, 'stale_generation');
+  assert.equal(closure.fail(next.handle, 'b', 'failure').settlement.code, 'tool_error');
+  assert.equal(closure.cancel(next.handle, 'c').settlement.code, 'cancelled');
+  assert.equal(closure.settle(next.handle, 'd', { status: 'error' }).settlement.code, 'error');
+  assert.equal(closure.close(next.handle).calls[3].settlement.code, 'cancelled');
+});
+
+test('explicit codes including built-in strings still honor maxCodeBytes', () => {
+  const closure = new ToolCallClosure({ maxCodeBytes: 1 });
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  assert.throws(() => closure.fail(handle, 'a', 'failure', 'tool_error'), /byte limit/);
+  assert.throws(() => closure.cancel(handle, 'a', 'cancel', 'cancelled'), /byte limit/);
+  assert.throws(() => closure.settle(handle, 'a', { status: 'error', code: 'error' }), /byte limit/);
+  assert.throws(() => closure.close(handle, { code: 'superseded' }), /byte limit/);
+  assert.equal(closure.snapshot().calls[0].state, 'pending');
+  assert.equal(closure.fail(handle, 'a', 'failure', 'x').settlement.code, 'x');
+});
+
+test('rejects forged snapshot objects without invoking their getters', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  let reads = 0;
+  const forged = { get calls() { reads += 1; closure.close(handle); return []; } };
+  assert.throws(() => closure.toOpenAIResponses(forged), /ToolCallClosure snapshot/);
+  assert.equal(reads, 0);
+  assert.equal(closure.snapshot().closed, false);
+});
+
+test('reentrant array access cannot replace a newer generation', () => {
+  for (const property of ['length', '0']) {
+    const closure = new ToolCallClosure();
+    closure.begin([{ id: 'old', name: 'old' }]);
+    let invoked = false;
+    const calls = new Proxy([{ id: 'outer', name: 'outer' }], { get(target, key) {
+      if (key === property && !invoked) {
+        invoked = true;
+        closure.begin([{ id: 'new', name: 'new' }]);
+      }
+      return Reflect.get(target, key);
+    } });
+    assert.throws(() => closure.begin(calls), /generation changed/);
+    assert.equal(closure.snapshot().calls[0].id, 'new');
+  }
+});
+
+test('a throwing serializer cannot undo its nested terminal write', () => {
+  const closure = new ToolCallClosure();
+  const { handle } = closure.begin([{ id: 'a', name: 'x' }]);
+  assert.throws(() => closure.succeed(handle, 'a', { toJSON() {
+    closure.close(handle, { code: 'first' });
+    throw new Error('serialization failed');
+  } }), /serialization failed/);
+  assert.equal(closure.snapshot().calls[0].settlement.code, 'first');
+  assert.equal(closure.snapshot().closed, true);
+});
