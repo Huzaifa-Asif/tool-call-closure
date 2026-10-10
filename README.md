@@ -203,6 +203,16 @@ Treat tool output as untrusted data. This package serializes it but does not san
 
 See [SECURITY.md](SECURITY.md) for reporting instructions.
 
+## Runnable example and related tool
+
+[`examples/abort-safe.mjs`](examples/abort-safe.mjs) settles one tool result,
+closes the remaining call after cancellation, and renders an OpenAI Responses
+payload. It is executed by `npm run check` and ships in the npm tarball.
+
+For durable separation between executing a side effect and delivering its
+result after reconnects, see
+[`tool-execution-checkpoint`](https://www.npmjs.com/package/tool-execution-checkpoint).
+
 ## Development
 
 ```sh
